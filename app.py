@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "subtitle_qc.db"
@@ -85,6 +85,37 @@ class Database:
                     updated_at TEXT NOT NULL,
                     UNIQUE(version_id,cue_index)
                 );
+                CREATE TABLE IF NOT EXISTS cue_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id),
+                    cue_id INTEGER NOT NULL REFERENCES cues(id),
+                    cue_index INTEGER NOT NULL,
+                    revision_no INTEGER NOT NULL,
+                    version_revision INTEGER NOT NULL,
+                    change_type TEXT NOT NULL CHECK(change_type IN ('create','update')),
+                    old_text TEXT,
+                    new_text TEXT NOT NULL,
+                    old_start_ms INTEGER,
+                    old_end_ms INTEGER,
+                    new_start_ms INTEGER NOT NULL,
+                    new_end_ms INTEGER NOT NULL,
+                    changed_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(cue_id,revision_no)
+                );
+                CREATE TRIGGER IF NOT EXISTS cue_revisions_no_update BEFORE UPDATE ON cue_revisions
+                BEGIN
+                    SELECT RAISE(ABORT,'修订记录不可修改');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cue_revisions_no_delete BEFORE DELETE ON cue_revisions
+                BEGIN
+                    SELECT RAISE(ABORT,'修订记录不可删除');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cue_revisions_no_late_insert BEFORE INSERT ON cue_revisions
+                BEGIN
+                    SELECT RAISE(ABORT,'版本已离开草稿阶段，修订记录不能再补记')
+                    WHERE (SELECT status FROM versions WHERE id=NEW.version_id) <> 'draft';
+                END;
                 CREATE TABLE IF NOT EXISTS comments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
@@ -292,8 +323,24 @@ class Database:
                 saved_id = cur.lastrowid
             revision = int(version["revision"]) + 1
             conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
-            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
-        return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
+            revision_no = self._record_cue_revision(conn, version_id, saved_id, cue_index, revision, existing, start_ms, end_ms, text, actor)
+            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision, "revision_no": revision_no})
+        return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision, "revision_no": revision_no}
+
+    def _record_cue_revision(self, conn: sqlite3.Connection, version_id: int, cue_id: int, cue_index: int,
+                             version_revision: int, old: sqlite3.Row | None, start_ms: int, end_ms: int,
+                             text: str, actor: str) -> int:
+        revision_no = int(conn.execute("SELECT COALESCE(MAX(revision_no),0)+1 value FROM cue_revisions WHERE cue_id=?", (cue_id,)).fetchone()["value"])
+        conn.execute(
+            """INSERT INTO cue_revisions(version_id,cue_id,cue_index,revision_no,version_revision,change_type,
+               old_text,new_text,old_start_ms,old_end_ms,new_start_ms,new_end_ms,changed_by,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (version_id, cue_id, cue_index, revision_no, version_revision, "update" if old else "create",
+             old["text"] if old else None, text,
+             old["start_ms"] if old else None, old["end_ms"] if old else None,
+             start_ms, end_ms, actor, utcnow()),
+        )
+        return revision_no
 
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         body = str(payload.get("body", "")).strip()
@@ -399,6 +446,14 @@ class Database:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)).fetchall()]
 
+    def list_cue_revisions(self, version_id: int, cue_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if cue_id is not None:
+                rows = conn.execute("SELECT * FROM cue_revisions WHERE version_id=? AND cue_id=? ORDER BY cue_id,revision_no", (version_id, cue_id)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM cue_revisions WHERE version_id=? ORDER BY cue_id,revision_no", (version_id,)).fetchall()
+            return [dict(r) for r in rows]
+
     def list_comments(self, version_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM comments WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
@@ -471,6 +526,9 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "revisions":
+                cue_id = parse_qs(parsed.query).get("cue_id", [None])[0]
+                return self._send({"revisions": self.db.list_cue_revisions(int(parts[2]), int(cue_id) if cue_id is not None else None)})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
             raise DomainError("接口不存在", 404)
