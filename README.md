@@ -23,6 +23,8 @@ python app.py --port 8009
 
 字幕保存会验证时长范围、起点小于终点、字幕重叠、序号冲突和术语表。术语表中配置的禁用译法会直接阻止保存；指定译法可用。
 
+每次保存字幕（新建或修改）都会向修订记录追加一条：旧文本 → 新文本、时间轴变化、修改人、时间和版本修订号。复核人可打开记录对比改动前后；退回后再次修改会在旧记录上继续叠加，历史一条不丢。版本锁定或交付后修订记录定死，数据库触发器禁止补记、修改或删除。
+
 ## API
 
 所有身份通过 `X-User`、`X-Role` 请求头模拟，角色包括 `owner`、`admin`、`translator`、`reviewer`、`timeline`。
@@ -34,7 +36,7 @@ python app.py --port 8009
 - `POST /api/versions/{id}/cues`：新增或修改字幕，要求 `expected_revision`。
 - `POST /api/versions/{id}/comments`：按具体时间毫秒或字幕 ID 评论。
 - `POST /api/versions/{id}/submit|review|lock|deliver`：完成审核交付状态机。
-- `GET /api/versions/{id}/cues|comments`、`GET /api/deliveries`：查看结果。
+- `GET /api/versions/{id}/cues|comments|revisions`、`GET /api/deliveries`：查看结果，`revisions` 返回该版本全部字幕修订记录。
 
 ## 测试
 

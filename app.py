@@ -131,6 +131,31 @@ class Database:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cue_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cue_id INTEGER NOT NULL REFERENCES cues(id) ON DELETE CASCADE,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    revision_seq INTEGER NOT NULL,
+                    old_text TEXT,
+                    new_text TEXT NOT NULL,
+                    old_start_ms INTEGER,
+                    new_start_ms INTEGER NOT NULL,
+                    old_end_ms INTEGER,
+                    new_end_ms INTEGER NOT NULL,
+                    old_cue_index INTEGER,
+                    new_cue_index INTEGER NOT NULL,
+                    changed_by TEXT NOT NULL,
+                    version_revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(cue_id,revision_seq)
+                );
+                CREATE TRIGGER IF NOT EXISTS cue_revisions_no_update BEFORE UPDATE ON cue_revisions
+                BEGIN SELECT RAISE(ABORT,'修订记录禁止修改'); END;
+                CREATE TRIGGER IF NOT EXISTS cue_revisions_no_delete BEFORE DELETE ON cue_revisions
+                BEGIN SELECT RAISE(ABORT,'修订记录禁止删除'); END;
+                CREATE TRIGGER IF NOT EXISTS cue_revisions_frozen_insert BEFORE INSERT ON cue_revisions
+                WHEN EXISTS (SELECT 1 FROM versions WHERE id=NEW.version_id AND status<>'draft')
+                BEGIN SELECT RAISE(ABORT,'版本不在草稿状态，不能补记修订记录'); END;
                 """
             )
 
@@ -284,15 +309,29 @@ class Database:
             index_owner = conn.execute("SELECT * FROM cues WHERE version_id=? AND cue_index=? AND id<>?", (version_id, cue_index, int(cue_id or -1))).fetchone()
             if index_owner:
                 raise DomainError("字幕序号已被使用", 409)
-            if existing:
-                conn.execute("UPDATE cues SET cue_index=?,start_ms=?,end_ms=?,text=?,updated_by=?,updated_at=? WHERE id=?", (cue_index, start_ms, end_ms, text, actor, utcnow(), existing["id"]))
-                saved_id = existing["id"]
-            else:
-                cur = conn.execute("INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)", (version_id, cue_index, start_ms, end_ms, text, actor, utcnow()))
-                saved_id = cur.lastrowid
+            saved_at = utcnow()
             revision = int(version["revision"]) + 1
-            conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
-            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
+            if existing:
+                conn.execute("UPDATE cues SET cue_index=?,start_ms=?,end_ms=?,text=?,updated_by=?,updated_at=? WHERE id=?", (cue_index, start_ms, end_ms, text, actor, saved_at, existing["id"]))
+                saved_id = existing["id"]
+                old_text = existing["text"]
+                old_start = int(existing["start_ms"])
+                old_end = int(existing["end_ms"])
+                old_index = int(existing["cue_index"])
+            else:
+                cur = conn.execute("INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)", (version_id, cue_index, start_ms, end_ms, text, actor, saved_at))
+                saved_id = int(cur.lastrowid)
+                old_text = old_start = old_end = old_index = None
+            seq_row = conn.execute("SELECT COALESCE(MAX(revision_seq),0)+1 value FROM cue_revisions WHERE cue_id=?", (saved_id,)).fetchone()
+            conn.execute(
+                """INSERT INTO cue_revisions(cue_id,version_id,revision_seq,old_text,new_text,old_start_ms,new_start_ms,
+                   old_end_ms,new_end_ms,old_cue_index,new_cue_index,changed_by,version_revision,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (saved_id, version_id, int(seq_row["value"]), old_text, text, old_start, start_ms,
+                 old_end, end_ms, old_index, cue_index, actor, revision, saved_at),
+            )
+            conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, saved_at, version_id))
+            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision, "revision_seq": int(seq_row["value"])})
         return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
 
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
@@ -399,6 +438,14 @@ class Database:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)).fetchall()]
 
+    def list_revisions(self, version_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if not self._version(conn, version_id):
+                raise DomainError("字幕版本不存在", 404)
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM cue_revisions WHERE version_id=? ORDER BY id", (version_id,)
+            ).fetchall()]
+
     def list_comments(self, version_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM comments WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
@@ -471,6 +518,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "revisions":
+                return self._send({"revisions": self.db.list_revisions(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
             raise DomainError("接口不存在", 404)
